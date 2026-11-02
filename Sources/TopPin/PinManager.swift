@@ -6,7 +6,7 @@ final class PinManager {
     static let shared = PinManager()
 
     private(set) var pins: [PinnedWindow] = []
-    private var pending = Set<CGWindowID>()
+    private var pending: [CGWindowID: Task<Void, Never>] = [:]
     private var timer: Timer?
     private var lastStack: [CGWindowID] = []
     private let myPID = ProcessInfo.processInfo.processIdentifier
@@ -77,17 +77,20 @@ final class PinManager {
     }
 
     func pin(_ info: WindowInfo) {
-        guard pin(for: info.id) == nil, !pending.contains(info.id) else { return }
+        guard pin(for: info.id) == nil, pending[info.id] == nil else { return }
         guard Permissions.hasScreenRecording else {
             Permissions.requestScreenRecording()
             return
         }
-        pending.insert(info.id)
-        Task { @MainActor [weak self] in
+        pending[info.id] = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.pending.remove(info.id) }
+            defer {
+                // A cancelled task must not remove a newer request for the same window.
+                if !Task.isCancelled { self.pending[info.id] = nil }
+            }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                try Task.checkCancellation()
                 guard let scWindow = content.windows.first(where: { $0.windowID == info.id }) else {
                     Toast.show("无法捕获该窗口", symbol: "exclamationmark.triangle")
                     return
@@ -96,12 +99,17 @@ final class PinManager {
                 p.onStreamStopped = { [weak self] p, _ in self?.unpin(p) }
                 p.onActivated = { [weak self] _ in self?.tick() }
                 try await p.start(window: scWindow)
+                if Task.isCancelled {
+                    p.stop()
+                    return
+                }
                 self.pins.append(p)
                 self.startTimerIfNeeded()
                 self.tick()
                 self.onChange?()
                 Toast.show("已置顶：\(p.displayName)", symbol: "pin.fill")
             } catch {
+                guard !Task.isCancelled else { return }
                 NSLog("TopPin: failed to pin window \(info.id): \(error)")
                 Toast.show("置顶失败：\(error.localizedDescription)", symbol: "exclamationmark.triangle")
             }
@@ -118,6 +126,8 @@ final class PinManager {
     }
 
     func unpinAll() {
+        pending.values.forEach { $0.cancel() }
+        pending.removeAll()
         let all = pins
         pins.removeAll()
         all.forEach { $0.stop() }
@@ -167,9 +177,7 @@ final class PinManager {
 
             var covered = false
             for o in list[..<idx] {
-                // Only normal windows of *other* apps count; the pinned app's own sheets,
-                // popovers and dialogs must stay usable on top of it.
-                guard o.layer == 0, o.alpha > 0.01, o.pid != myPID, o.pid != p.pid else { continue }
+                guard o.layer == 0, o.alpha > 0.01, o.pid != myPID else { continue }
                 if PinManager.overlaps(o.bounds, w.bounds) { covered = true; break }
             }
             occluded[p.windowID] = covered
@@ -196,7 +204,7 @@ final class PinManager {
         }
 
         for p in pins {
-            let shouldShow = p.alwaysFloat || Settings.shared.alwaysFloatByDefault || (occluded[p.windowID] ?? false)
+            let shouldShow = p.alwaysFloat || (occluded[p.windowID] ?? false)
             p.setOverlayVisible(shouldShow)
         }
 
